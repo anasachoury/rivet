@@ -838,6 +838,88 @@ pub(crate) mod moved_tests {
 	}
 
 	#[derive(Default)]
+	struct SleepOrderSignals {
+		log: parking_lot::Mutex<Vec<&'static str>>,
+		slow_started: Notify,
+		release_slow: Notify,
+		on_sleep_started: Notify,
+		release_on_sleep: Notify,
+	}
+
+	impl SleepOrderSignals {
+		fn record(&self, event: &'static str) {
+			self.log.lock().push(event);
+		}
+
+		fn log(&self) -> Vec<&'static str> {
+			self.log.lock().clone()
+		}
+	}
+
+	/// The `slow` action replies after `release_slow`. When `hold_on_sleep` is set,
+	/// onSleep replies after `release_on_sleep`. Every step is recorded in order.
+	fn sleep_order_factory(
+		config: ActorConfig,
+		signals: Arc<SleepOrderSignals>,
+		hold_on_sleep: bool,
+	) -> Arc<ActorFactory> {
+		Arc::new(ActorFactory::new(config, move |start| {
+			let signals = signals.clone();
+			Box::pin(async move {
+				let mut events = start.events;
+				while let Some(event) = events.recv().await {
+					match event {
+						ActorEvent::Action { name, reply, .. } if name == "slow" => {
+							signals.record("slow_started");
+							signals.slow_started.notify_one();
+							let signals = signals.clone();
+							tokio::spawn(async move {
+								signals.release_slow.notified().await;
+								signals.record("slow_finished");
+								reply.send(Ok(Vec::new()));
+							});
+						}
+						ActorEvent::Action { reply, .. } => {
+							signals.record("ping");
+							reply.send(Ok(Vec::new()));
+						}
+						ActorEvent::RunGracefulCleanup { reply, .. } => {
+							signals.record("on_sleep");
+							signals.on_sleep_started.notify_one();
+							let signals = signals.clone();
+							tokio::spawn(async move {
+								if hold_on_sleep {
+									signals.release_on_sleep.notified().await;
+								}
+								reply.send(Ok(()));
+							});
+						}
+						_ => {}
+					}
+				}
+				Ok(())
+			})
+		}))
+	}
+
+	fn dispatch_action(
+		dispatch_tx: &mpsc::UnboundedSender<DispatchCommand>,
+		name: &str,
+	) -> oneshot::Receiver<anyhow::Result<Vec<u8>>> {
+		let (reply_tx, reply_rx) = oneshot::channel();
+		dispatch_tx
+			.send(DispatchCommand::Action {
+				name: name.to_owned(),
+				args: Vec::new(),
+				incoming: IncomingInvocationContext::default(),
+				conn: ConnHandle::new("conn-sleep-order", Vec::new(), Vec::new(), false),
+				reply: reply_tx,
+			})
+			.expect("action should send");
+		reply_rx
+	}
+
+	#[derive(Default)]
 	struct MessageVisitor {
 		message: Option<String>,
 		channel: Option<String>,
@@ -3708,8 +3790,8 @@ pub(crate) mod moved_tests {
 			.expect("task run should succeed");
 	}
 
-	#[tokio::test]
-	async fn sleep_grace_keeps_dispatch_open_and_second_sleep_is_idempotent() {
+	#[tokio::test(start_paused = true)]
+	async fn sleep_grace_runs_on_sleep_after_keep_awake_work_and_second_sleep_is_idempotent() {
 		let ctx = new_with_kv(
 			"actor-sleep-grace-dispatch",
 			"task-sleep-grace-dispatch",
@@ -3761,9 +3843,6 @@ pub(crate) mod moved_tests {
 				reply: sleep_tx,
 			})
 			.expect("sleep stop should send");
-		wait_for_count(&begin_sleep_count, 1).await;
-		assert!(ctx.actor_aborted());
-
 		let (sleep_again_tx, sleep_again_rx) = oneshot::channel();
 		lifecycle_tx
 			.send(LifecycleCommand::Stop {
@@ -3775,27 +3854,21 @@ pub(crate) mod moved_tests {
 			.await
 			.expect("second sleep reply should send")
 			.expect("second sleep should no-op");
-		assert_eq!(begin_sleep_count.load(Ordering::SeqCst), 1);
+		assert!(ctx.actor_aborted());
 
-		let (action_tx, action_rx) = oneshot::channel();
-		dispatch_tx
-			.send(DispatchCommand::Action {
-				name: "ping".to_owned(),
-				args: Vec::new(),
-				incoming: IncomingInvocationContext::default(),
-				conn: ConnHandle::new("conn-grace", Vec::new(), Vec::new(), false),
-				reply: action_tx,
-			})
-			.expect("action should send during sleep grace");
+		// Paused time runs every ready task before the clock moves, so onSleep
+		// would have run by now if it did not wait for the keep-awake work.
+		sleep(Duration::from_millis(100)).await;
+		assert_eq!(begin_sleep_count.load(Ordering::SeqCst), 0);
+
 		assert_eq!(
-			action_rx
+			dispatch_action(&dispatch_tx, "ping")
 				.await
 				.expect("action reply should send")
-				.expect("sleep grace should accept new dispatch"),
+				.expect("sleep grace should accept dispatch before onSleep runs"),
 			vec![7, 7, 7]
 		);
 		assert_eq!(action_count.load(Ordering::SeqCst), 1);
-		assert_eq!(destroy_count.load(Ordering::SeqCst), 0);
 
 		release_tx.send(()).expect("keep-awake release should send");
 		sleep_rx
@@ -3805,7 +3878,188 @@ pub(crate) mod moved_tests {
 		keep_awake
 			.await
 			.expect("keep-awake task should finish after release");
+		assert_eq!(begin_sleep_count.load(Ordering::SeqCst), 1);
 		assert_eq!(destroy_count.load(Ordering::SeqCst), 0);
+		run.await
+			.expect("task run should finish")
+			.expect("task run should succeed");
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn sleep_runs_on_sleep_after_in_flight_action_replies() {
+		let ctx = new_with_kv(
+			"actor-sleep-order-action",
+			"task-sleep-order-action",
+			Vec::new(),
+			"local",
+			new_in_memory(),
+		);
+		let (mut task, lifecycle_tx, dispatch_tx, _events_tx) = new_task_with_senders(ctx.clone());
+		let signals = Arc::new(SleepOrderSignals::default());
+		task.factory = sleep_order_factory(
+			ActorConfig {
+				sleep_grace_period: Duration::from_secs(5),
+				sleep_grace_period_overridden: true,
+				..ActorConfig::default()
+			},
+			signals.clone(),
+			false,
+		);
+		let run = tokio::spawn(task.run());
+
+		let (start_tx, start_rx) = oneshot::channel();
+		lifecycle_tx
+			.send(LifecycleCommand::Start { reply: start_tx })
+			.expect("start command should send");
+		start_rx
+			.await
+			.expect("start reply should send")
+			.expect("start should succeed");
+
+		let slow = dispatch_action(&dispatch_tx, "slow");
+		signals.slow_started.notified().await;
+
+		let (sleep_tx, sleep_rx) = oneshot::channel();
+		lifecycle_tx
+			.send(LifecycleCommand::Stop {
+				reason: ShutdownKind::Sleep,
+				reply: sleep_tx,
+			})
+			.expect("sleep stop should send");
+		// Paused time runs every ready task before the clock moves, so onSleep
+		// would have run by now if it did not wait for the action.
+		sleep(Duration::from_millis(100)).await;
+		assert_eq!(signals.log(), vec!["slow_started"]);
+
+		signals.release_slow.notify_one();
+		slow.await
+			.expect("slow action reply should send")
+			.expect("slow action should finish");
+		sleep_rx
+			.await
+			.expect("sleep reply should send")
+			.expect("sleep should succeed");
+		assert_eq!(
+			signals.log(),
+			vec!["slow_started", "slow_finished", "on_sleep"]
+		);
+		run.await
+			.expect("task run should finish")
+			.expect("task run should succeed");
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn sleep_runs_on_sleep_at_the_hook_reserve_when_work_outlives_it() {
+		let ctx = new_with_kv(
+			"actor-sleep-order-reserve",
+			"task-sleep-order-reserve",
+			Vec::new(),
+			"local",
+			new_in_memory(),
+		);
+		let (mut task, lifecycle_tx, dispatch_tx, _events_tx) = new_task_with_senders(ctx.clone());
+		let signals = Arc::new(SleepOrderSignals::default());
+		task.factory = sleep_order_factory(
+			ActorConfig {
+				sleep_grace_period: Duration::from_secs(4),
+				sleep_grace_period_overridden: true,
+				..ActorConfig::default()
+			},
+			signals.clone(),
+			false,
+		);
+		let run = tokio::spawn(task.run());
+
+		let (start_tx, start_rx) = oneshot::channel();
+		lifecycle_tx
+			.send(LifecycleCommand::Start { reply: start_tx })
+			.expect("start command should send");
+		start_rx
+			.await
+			.expect("start reply should send")
+			.expect("start should succeed");
+
+		let _slow = dispatch_action(&dispatch_tx, "slow");
+		signals.slow_started.notified().await;
+
+		let stopped_at = tokio::time::Instant::now();
+		let (sleep_tx, sleep_rx) = oneshot::channel();
+		lifecycle_tx
+			.send(LifecycleCommand::Stop {
+				reason: ShutdownKind::Sleep,
+				reply: sleep_tx,
+			})
+			.expect("sleep stop should send");
+		signals.on_sleep_started.notified().await;
+		let waited = stopped_at.elapsed();
+		// The last quarter of the 4 second grace period is kept for onSleep.
+		assert!(
+			waited >= Duration::from_secs(3) && waited < Duration::from_secs(4),
+			"onSleep should run at the hook reserve, ran after {waited:?}"
+		);
+
+		sleep_rx
+			.await
+			.expect("sleep reply should send")
+			.expect("sleep should succeed");
+		run.await
+			.expect("task run should finish")
+			.expect("task run should succeed");
+	}
+
+	#[tokio::test]
+	async fn sleep_refuses_dispatch_once_on_sleep_runs() {
+		let ctx = new_with_kv(
+			"actor-sleep-order-refuse",
+			"task-sleep-order-refuse",
+			Vec::new(),
+			"local",
+			new_in_memory(),
+		);
+		let (mut task, lifecycle_tx, dispatch_tx, _events_tx) = new_task_with_senders(ctx.clone());
+		let signals = Arc::new(SleepOrderSignals::default());
+		task.factory = sleep_order_factory(
+			ActorConfig {
+				sleep_grace_period: Duration::from_secs(5),
+				sleep_grace_period_overridden: true,
+				..ActorConfig::default()
+			},
+			signals.clone(),
+			true,
+		);
+		let run = tokio::spawn(task.run());
+
+		let (start_tx, start_rx) = oneshot::channel();
+		lifecycle_tx
+			.send(LifecycleCommand::Start { reply: start_tx })
+			.expect("start command should send");
+		start_rx
+			.await
+			.expect("start reply should send")
+			.expect("start should succeed");
+
+		let (sleep_tx, sleep_rx) = oneshot::channel();
+		lifecycle_tx
+			.send(LifecycleCommand::Stop {
+				reason: ShutdownKind::Sleep,
+				reply: sleep_tx,
+			})
+			.expect("sleep stop should send");
+		signals.on_sleep_started.notified().await;
+
+		let error = dispatch_action(&dispatch_tx, "ping")
+			.await
+			.expect("action reply should send")
+			.expect_err("dispatch should be refused once onSleep runs");
+		let error = rivet_error::RivetError::extract(&error);
+		assert_eq!((error.group(), error.code()), ("actor", "restarting"));
+		assert_eq!(signals.log(), vec!["on_sleep"]);
+
+		signals.release_on_sleep.notify_one();
+		sleep_rx
+			.await
+			.expect("sleep reply should send")
+			.expect("sleep should succeed");
 		run.await
 			.expect("task run should finish")
 			.expect("task run should succeed");
@@ -3837,10 +4091,8 @@ pub(crate) mod moved_tests {
 			.await
 			.expect("action reply should send")
 			.expect_err("sleep finalize should reject new dispatch");
-		assert!(
-			format!("{error:#}").contains("Actor is stopping"),
-			"expected actor stopping error, got {error:#}"
-		);
+		let error = rivet_error::RivetError::extract(&error);
+		assert_eq!((error.group(), error.code()), ("actor", "restarting"));
 	}
 
 	#[cfg(not(debug_assertions))]
@@ -4192,6 +4444,16 @@ pub(crate) mod moved_tests {
 			!ctx.is_destroy_requested(),
 			"a crash must not request a destroy"
 		);
+
+		// The errored stop request runs as tracked shutdown work, and sleep hooks
+		// wait for that work. This test drives the task by hand, so let it finish.
+		timeout(Duration::from_secs(2), async {
+			while ctx.shutdown_task_count() != 0 {
+				yield_now().await;
+			}
+		})
+		.await
+		.expect("errored stop request should finish");
 
 		let (stop_tx, stop_rx) = oneshot::channel();
 		task.handle_lifecycle(LifecycleCommand::Stop {
